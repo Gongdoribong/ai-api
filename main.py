@@ -42,17 +42,17 @@ models = {}
 # Lifespan : 서버 켜질 때와 꺼질 때의 동작을 정의 (startup 대신)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("===== 서버 시작 =====")
+    print("===== 서버 시작 [테스트] =====")
     
     # 환경 변수에서 경로 가져오기
     base_dir = os.environ.get("nnUNet_results", "./weights")
-    model_folder = os.path.join(base_dir, "Dataset001_Liver", "nnUNetTrainer__nnUNetPlans__2d")
+    model_folder = os.path.join(base_dir, "Dataset501_LiverLocal", "nnUNetTrainer__nnUNetPlans__2d")
     
     predictor = nnUNetPredictor(
         tile_step_size = 0.5,
         use_gaussian = True,
         use_mirroring = True,
-        perform_everything_on_gpu = True,
+        perform_everything_on_device = True,
         device = torch.device('cuda', 0),
         verbose = False,
         verbose_preprocessing = False,
@@ -66,7 +66,30 @@ async def lifespan(app: FastAPI):
         checkpoint_name = 'checkpoint_best.pth'
     )
     
+    #-----------------------------------
+    #   테스트 코드
+    #-----------------------------------
+    # # 1. 차원(Dimension) 확인: 2D인지 3D인지 확실하게 판별
+    # patch_size = predictor.configuration_manager.patch_size
+    # print(f"▶ 1. 패치 사이즈 (공간 차원): {patch_size} -> 공간 차원이 {len(patch_size)}개이므로 {len(patch_size)}D 모델입니다.")
+    
+    # # 2. 채널(Channel) 수 확인: 모달리티(CT, MRI 등)가 몇 개 들어와야 하는지
+    # channels = predictor.dataset_json.get('channel_names', {})
+    # num_channels = len(channels)
+    # print(f"▶ 2. 필요 채널 수: {num_channels}개 (상세: {channels})")
+    
+    # # 종합 결론
+    # expected_shape = [num_channels] + list(patch_size)
+    # print(f"▶ 💡 최종 결론: 이 모델은 Numpy 배열이 {expected_shape} 형태(또는 이와 유사한 비율)로 들어오기를 기다리고 있습니다!")
+    # print("="*40 + "\n")
+    
+    
     models["predictor"] = predictor
+    #-----------------------------------
+    #   테스트 코드
+    #-----------------------------------
+    # models["predictor"] = "DUMMY_MODE"
+    
     print("===== 모델 로드 완료 =====")
     
     yield   # 서버가 정상적으로 동작 시작
@@ -86,6 +109,10 @@ class SegRequest(BaseModel):
     ClassName: str
     
 
+
+
+
+
 # 유틸리티: 마스크를 Polyline으로 변환
 def mask_to_polyline(mask: np.ndarray, z_index: int):
     # mask에서 외곽선 추출
@@ -97,6 +124,11 @@ def mask_to_polyline(mask: np.ndarray, z_index: int):
         points = [[float(pt[0][0]), float(pt[0][1]), float(z_index)] for pt in cnt]
         polylines.append(points)
     return polylines
+
+
+
+
+
 
 # z축 정렬 후 요청받은 슬라이스 로드
 def load_dicom_slice(StudyUID: str, SeriesUID: str, image_index: int):
@@ -137,15 +169,16 @@ def load_dicom_slice(StudyUID: str, SeriesUID: str, image_index: int):
     img = img * slope + intercept
     
     # nnU-Net 2D 입력 형태 맞추기: [C, H, W]
-    image_2d = img[np.newaxis, ...]
+    image_3d_box = img[np.newaxis, np.newaxis, ...]
     
     # 2D Spacing 정보 추출 [Y Spacing, X Spacing]
-    spacing_2d = [
+    spacing_3d = [
+        999.0,
         float(target_dcm.PixelSpacing[0]),
         float(target_dcm.PixelSpacing[1])
     ]
     
-    return image_2d, spacing_2d, target_dcm
+    return image_3d_box, spacing_3d, target_dcm
 
 
 
@@ -158,58 +191,114 @@ async def predict_segmentation(req: SegRequest):
         if not predictor:
             raise HTTPException(status_code=500, detail="모델이 아직 로드되지 않았습니다.")
         
-        # 로컬 DICOM 로드 (실제 환경에서는 DICOM 파일들을 ImagePositionPatient[2] 기준으로 정렬하여 3D로 쌓아야 함)
+        # 로컬 DICOM 로드
         #✅ StudyUID, SeriesUID를 통해서 원래는 PACS에서 가져오지만, 현재는 로컬에서 해당 DICOM 파일을 가져옵니다.
-        image_2d, spacing_2d, ref_dcm = load_dicom_slice(
+        image_3d_box, spacing_3d, ref_dcm = load_dicom_slice(
             req.StudyUID, req.SeriesUID, req.image_index
         )
         
         # 2D 모델 추론 진행 (props에 2D spacing 전달)
-        props = {'spacing': spacing_2d}
-        segmentation = predictor.predict_from_numpy(
-            image_2d,
-            props=props,
+        props = {'spacing': spacing_3d}
+        
+        
+        # ==========================================
+        # 테스트코드
+        # ==========================================
+        print("\n" + "="*40)
+        print("🚀 [추론 직전 데이터 최종 확인]")
+        print(f"▶ 1. 입력 이미지 형태(Shape): {image_3d_box.shape}")
+        print(f"▶ 2. Spacing 리스트 길이: {len(props['spacing'])}개")
+        print(f"▶ 3. Spacing 값: {props['spacing']}")
+        print("="*40 + "\n")
+        
+        
+        segmentation = predictor.predict_from_list_of_npy_arrays(
+            [image_3d_box],
+            None,
+            [props],
+            None,
+            1,
             save_probabilities=False,
             num_processes_segmentation_export=1
         )
         
-        target_mask = segmentation
+        target_mask = segmentation[0][0]
+        
+        ##-----------------------------------
+        ##  테스트 코드
+        ##-----------------------------------
+        # h, w = image_2d.shape[1], image_2d.shape[2]
+        # target_mask = np.zeros((h, w), dtype=np.uint8)
+        # cv2.circle(target_mask, (w//2, h//2), 50, 1, -1)
+        
+        # # ==========================================
+        # # 🛠️ [더미 테스트 코드] 가짜 다중 클래스 마스크 생성
+        # # ==========================================
+        # # 1. 원본 이미지와 똑같은 크기의 빈 까만 도화지(0)를 만듭니다.
+        # h, w = image_3d_box.shape[2], image_3d_box.shape[3]
+        # dummy_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # # 2. 간(Liver, 라벨 1) 생성: 정중앙에 반지름 100짜리 큰 원을 그립니다.
+        # cv2.circle(dummy_mask, (w//2, h//2), 100, 1, -1)
+
+        # # 3. 종양(HCC, 라벨 2): 간 내부 우측 상단에 반지름 30짜리 작은 원을 그립니다.
+        # cv2.circle(dummy_mask, (w//2 + 40, h//2 - 40), 30, 2, -1)
+
+        # # 4. 가짜 도화지를 파이프라인에 넘겨줍니다!
+        # target_mask = dummy_mask
+        
         
         # 4. JSON 포맷팅
         #✅ Segmentation MASK는 Class Name에 맞춰 JSON 파일로 형식화 하여 저장합니다.
-        polylines = mask_to_polyline(target_mask, req.image_index)
+        # polylines = mask_to_polyline(target_mask, req.image_index)
+        
+        # 슬라이스의 실제 UID 추출
+        InstanceUID = os.path.basename(ref_dcm.filename)
+        
+        CLASS_MAP = {
+            1: {"name": "Liver", "color": "#FF0000"},
+            2: {"name": "HCC", "color": "#00FF00"}
+        }
         
         annotations = []
-        for poly in polylines:
-            annotation_node = {
-                "data": {
-                    "label": req.ClassName,
-                    "contour": {"closed":""}, # ❔❔❔ 이거 뭐임
-                    "handles": {
-                        "points": [],   # ❔❔❔
-                        "textBox": {
-                            "hasMoved": False,
-                            "worldPosition": [0, 0, 0]
-                        },
-                    "activeHandleIndex": None
-                    },
-                    "polyline": poly,
-                    "cachedStats": {}
-                },
-                "type": 1,
-                "color": "#FF0000", #################
-                "metadata": {
-                    "toolName": "PlanarFreehandROI", ###########
-                    "referenceImageId": f"/studies/{req.study_uid}/series/{req.series_uid}/instances/..." #########
-                }
-            }
-            annotations.append(annotation_node)
+        
+        for class_idx, class_info in CLASS_MAP.items():
+            binary_mask = (target_mask == class_idx).astype(np.uint8)
+            if not np.any(binary_mask):
+                continue
             
+            polylines = mask_to_polyline(binary_mask, req.image_index)
+
+            for poly in polylines:
+                annotation_node = {
+                    "data": {
+                        "label": class_info["name"],
+                        "contour": {"closed":""},
+                        "handles": {
+                            "points": [],
+                            "textBox": {
+                                "hasMoved": False,
+                                "worldPosition": [0, 0, 0]
+                            },
+                        "activeHandleIndex": None
+                        },
+                        "polyline": poly,
+                        "cachedStats": {}
+                    },
+                    "type": 1,
+                    "color": class_info["color"],
+                    "metadata": {
+                        "toolName": "PlanarFreehandROI",
+                        "referenceImageId": f"/local_data/{req.StudyUID}/{req.SeriesUID}/{InstanceUID}"
+                    }
+                }
+                annotations.append(annotation_node)
+                
         return {"status": "success", "results": annotations}
     
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": repr(e)}
     
-if __name__ = "__main__":
+if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
