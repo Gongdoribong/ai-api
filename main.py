@@ -1,107 +1,164 @@
 import os
 import cv2
+import base64
 import numpy as np
-import torch
 import pydicom
+import shutil
+import torch
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from typing import List
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
-'''
-https://github.com/MIC-DKFZ/nnUNet/blob/master/nnunetv2/inference/predict_from_raw_data.py
-class nnUNetPredictor(object):
-    def __init__(self,
-                tile_step_size: float = 0.5,
-                use_gaussian: bool = True,
-                use_mirroring: bool = True,
-                perform_everything_on_device: bool = True,
-                device: torch.device = torch.device('cuda'),
-                verbose: bool = False,
-                verbose_preprocessing: bool = False,
-                allow_tqdm: bool = True):
-                
-                
-    def initialize_from_trained_model_folder(self, model_training_output_dir: str,
-                                            use_folds: Union[Tuple[Union[int, str]], None],
-                                            checkpoint_name: str = 'checkpoint_final.pth'):
-        """
-        This is used when making predictions with a trained model
-        """
-'''
+from utils import mask_to_polyline, load_dicom_slice
+from api_polling import router as polling_router
+from api_sse import router as sse_router
+from api_websocket import router as ws_router
 
 # .env 파일에서 환경 변수 로드
 load_dotenv()
 
-# 모델을 저장할 딕셔너리
-models = {}
+# 전역 상태 저장 : UI 뷰어에서 파일 인덱스를 추적하기 위한 상태
+dataset_state = {"files": [], "current_idx": 0}
 
-# Lifespan : 서버 켜질 때와 꺼질 때의 동작을 정의 (startup 대신)
+
+
+# 서버 Lifespan: nnU-Net 모델 로드
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("===== 서버 시작 [테스트] =====")
+    print("==== 서버 시작 ====")
     
-    # 환경 변수에서 경로 가져오기
+    app.state.models = {}
     base_dir = os.environ.get("nnUNet_results", "./weights")
     model_folder = os.path.join(base_dir, "Dataset501_LiverLocal", "nnUNetTrainer__nnUNetPlans__2d")
     
+    # 모델 인스턴스화
     predictor = nnUNetPredictor(
-        tile_step_size = 0.5,
-        use_gaussian = True,
-        use_mirroring = True,
-        perform_everything_on_device = True,
-        device = torch.device('cuda', 0),
-        verbose = False,
-        verbose_preprocessing = False,
-        allow_tqdm = False
+        tile_step_size= 0.5,
+        use_gaussian= True,
+        use_mirroring= True,
+        perform_everything_on_device= True,
+        device= torch.device('cuda', 0),
+        verbose= False,
+        verbose_preprocessing= False,
+        allow_tqdm= False
     )
     
-    # 가중치 GPU에 올리기
-    predictor.initialize_from_trained_model_folder(
-        model_folder,
-        use_folds = (0,),
-        checkpoint_name = 'checkpoint_best.pth'
-    )
+    # 가중치 로드
+    predictor.initialize_from_trained_model_folder(model_folder, use_folds=(0,), checkpoint_name='checkpoint_best.pth')
     
-    #-----------------------------------
-    #   테스트 코드
-    #-----------------------------------
-    # # 1. 차원(Dimension) 확인: 2D인지 3D인지 확실하게 판별
-    # patch_size = predictor.configuration_manager.patch_size
-    # print(f"▶ 1. 패치 사이즈 (공간 차원): {patch_size} -> 공간 차원이 {len(patch_size)}개이므로 {len(patch_size)}D 모델입니다.")
+    app.state.models["predictor"] = predictor
+    # app.state.models["predictor"] = "DUMMY_MODE"
     
-    # # 2. 채널(Channel) 수 확인: 모달리티(CT, MRI 등)가 몇 개 들어와야 하는지
-    # channels = predictor.dataset_json.get('channel_names', {})
-    # num_channels = len(channels)
-    # print(f"▶ 2. 필요 채널 수: {num_channels}개 (상세: {channels})")
+    print("==== 모델 로드 완료 ====")
     
-    # # 종합 결론
-    # expected_shape = [num_channels] + list(patch_size)
-    # print(f"▶ 💡 최종 결론: 이 모델은 Numpy 배열이 {expected_shape} 형태(또는 이와 유사한 비율)로 들어오기를 기다리고 있습니다!")
-    # print("="*40 + "\n")
+    yield
     
+    print("==== 서버 종료 ====")
     
-    models["predictor"] = predictor
-    #-----------------------------------
-    #   테스트 코드
-    #-----------------------------------
-    # models["predictor"] = "DUMMY_MODE"
-    
-    print("===== 모델 로드 완료 =====")
-    
-    yield   # 서버가 정상적으로 동작 시작
-    
-    print("===== 서버 종료 =====")
-    models.clear()
-    
+    app.state.models.clear()
 
-app = FastAPI(title="nnU-Net API", lifespan=lifespan)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    
+app = FastAPI(title="nnU-Net API & Viewer", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# 요청 스키마
-#✅ 입력 파라미터는 StudyUID, SeriesUID, image index, Class Name 4가지를 받도록 합니다.
+app.include_router(polling_router)
+app.include_router(sse_router)
+app.include_router(ws_router)
+
+
+# 뷰어 UI 지원 API: 파일 전송 및 조회
+@app.get("/health")
+async def health():
+    return {"status": "ok", "device": "cuda:0"}
+
+
+
+
+@app.post("/api/upload_folder")
+async def upload_folder(files: List[UploadFile] = File(...)):
+    slice_info_list = []
+    study_uid = "unknown_study"
+    series_uid = "unknown_series"
+    
+    for file in files:
+        temp_path = f"./temp_{file.filename}"
+        
+        # [[ 문제 ]]
+        # " 파일 업로드 중 서버와 통신할 수 없습니다."
+        #
+        # [[ 설명 ]]
+        # HTML5의 폴더 선택기(webkitdirectory)는 서버로 파일을 보낼 때,
+        # 자신이 속해 있던 폴더 이름까지 포함된 경로(20141111/IN...dcm)를 통째로 file.filename에 담아서 보냄
+        # 파일 이름에 20141111/이 섞여 들어오다 보니, 임시 파일 경로를 만드는
+        # f"./temp_{file.filename}" 로직이 오작동하여 ./temp_20141111/라는 하위 폴더에 파일을 쓰려고 시도하다가 서버가 뻗음
+        # 
+        # [[ 해결책 ]]
+        # 파일을 저장(open)하기 직전에, 파일이 들어갈 부모 폴더 경로를 먼저 생성
+        # 
+
+        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+        
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        try:
+            ds = pydicom.dcmread(temp_path, stop_before_pixels=True)
+            if hasattr(ds, 'StudyInstanceUID'): study_uid = str(ds.StudyInstanceUID)
+            if hasattr(ds, 'SeriesInstanceUID'): series_uid = str(ds.SeriesInstanceUID)
+            
+            z_pos = float(ds.ImagePositionPatient[2]) if hasattr(ds, 'ImagePositionPatient') else 0.0
+            
+            final_dir = f"./local_data/{study_uid}/{series_uid}"
+            os.makedirs(final_dir, exist_ok=True)
+            
+            filename = os.path.basename(file.filename)
+            final_path = os.path.join(final_dir, filename)
+            
+            shutil.move(temp_path, final_path)
+            slice_info_list.append((z_pos, final_path))
+            
+        except Exception as e:
+            print(f"❌ 파일 처리 실패 ({file.filename}): {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            
+    slice_info_list.sort(key=lambda x: x[0])
+    
+    saved_files = [item[1] for item in slice_info_list]
+    dataset_state["files"] = saved_files
+    
+    # 프론트앤드가 이 UID를 받아 /predict/segmentation에 사용
+    return {"count": len(saved_files), "StudyUID": study_uid, "SeriesUID": series_uid}
+
+
+
+@app.get("/api/image/{idx}")
+async def get_image(idx: int):
+    fpath = dataset_state["files"][idx]
+    if fpath.lower().endswith(".dcm"):
+        ds = pydicom.dcmread(fpath)
+        img = ds.pixel_array
+        img = ((img - img.min()) / (img.max() - img.min()) * 255).astype(np.uint8)
+        if len(img.shape)==2: img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        
+    else:
+        img = cv2.imdecode(np.fromfile(fpath, np.uint8), cv2.IMREAD_COLOR)
+        
+    _, buf = cv2.imencode('.png', img)
+    return {"image": base64.b64encode(buf).decode('utf-8'), "width": img.shape[1], "height": img.shape[0], "index": idx}
+
+
+# 모델 추론 API
 class SegRequest(BaseModel):
     StudyUID: str
     SeriesUID: str
@@ -109,158 +166,43 @@ class SegRequest(BaseModel):
     ClassName: str
     
 
-
-
-
-
-# 유틸리티: 마스크를 Polyline으로 변환
-def mask_to_polyline(mask: np.ndarray, z_index: int):
-    # mask에서 외곽선 추출
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)   #❔❔❔
-    
-    polylines = []
-    for cnt in contours:
-        # [x, y, z] 형식의 리스트 생성 ( [532.5, 780.5, 0], [531.5, 781.5, 0], [528.5, 781.5, 0], ...)
-        points = [[float(pt[0][0]), float(pt[0][1]), float(z_index)] for pt in cnt]
-        polylines.append(points)
-    return polylines
-
-
-
-
-
-
-# z축 정렬 후 요청받은 슬라이스 로드
-def load_dicom_slice(StudyUID: str, SeriesUID: str, image_index: int):
-    base_dir = f"./local_data/{StudyUID}/{SeriesUID}"
-    if not os.path.exists(base_dir):
-        raise FileNotFoundError(f"DICOM 경로를 찾을 수 없습니다: {base_dir}")
-    
-    slice_info = []
-    for filename in os.listdir(base_dir):
-        filepath = os.path.join(base_dir, filename)
-        try:
-            dcm_meta = pydicom.dcmread(filepath, stop_before_pixels=True)
-            if hasattr(dcm_meta, 'ImagePositionPatient'):
-                z_pos = float(dcm_meta.ImagePositionPatient[2])
-                slice_info.append((z_pos, filepath))
-                
-        except Exception:
-            continue
-    
-    if not slice_info:
-        raise ValueError("유효한 DICOM 파일이 없습니다.")
-    
-    # z축 기준으로 정렬
-    slice_info.sort(key=lambda x: x[0])
-    
-    if image_index < 0 or image_index >= len(slice_info):
-        raise IndexError(f"요청한 image_index({image_index})가 범위를 벗어났습니다. (총 {len(slice_info)}장)")
-    
-    target_filepath = slice_info[image_index][1]
-    
-    # 타겟 슬라이스 영상 데이터를 포함해 로드
-    target_dcm = pydicom.dcmread(target_filepath)
-    img = target_dcm.pixel_array.astype(np.float32)
-    
-    # ct의 경우 실제 밀도 값(HU)으로 복원
-    intercept = getattr(target_dcm, 'RescaleIntercept', 0.0)
-    slope = getattr(target_dcm, 'RescaleSlope', 1.0)
-    img = img * slope + intercept
-    
-    # nnU-Net 2D 입력 형태 맞추기: [C, H, W]
-    image_3d_box = img[np.newaxis, np.newaxis, ...]
-    
-    # 2D Spacing 정보 추출 [Y Spacing, X Spacing]
-    spacing_3d = [
-        999.0,
-        float(target_dcm.PixelSpacing[0]),
-        float(target_dcm.PixelSpacing[1])
-    ]
-    
-    return image_3d_box, spacing_3d, target_dcm
-
-
-
-# API 엔드포인트
 @app.post("/predict/segmentation")
-async def predict_segmentation(req: SegRequest):
+async def predict_segmentation(req: SegRequest, request: Request):
     try:
-        # 모델 불러오기
-        predictor = models.get("predictor")
+        predictor = request.app.state.models.get("predictor")
         if not predictor:
-            raise HTTPException(status_code=500, detail="모델이 아직 로드되지 않았습니다.")
+            raise HTTPException(status_code=500, detail="모델이 로드되지 않았습니다.")
         
-        # 로컬 DICOM 로드
-        #✅ StudyUID, SeriesUID를 통해서 원래는 PACS에서 가져오지만, 현재는 로컬에서 해당 DICOM 파일을 가져옵니다.
-        image_3d_box, spacing_3d, ref_dcm = load_dicom_slice(
-            req.StudyUID, req.SeriesUID, req.image_index
-        )
-        
-        # 2D 모델 추론 진행 (props에 2D spacing 전달)
+        # DICOM 로드
+        image_3d_box, spacing_3d, ref_dcm = load_dicom_slice(req.StudyUID, req.SeriesUID, req.image_index)
         props = {'spacing': spacing_3d}
         
-        
-        # ==========================================
-        # 테스트코드
-        # ==========================================
-        print("\n" + "="*40)
-        print("🚀 [추론 직전 데이터 최종 확인]")
-        print(f"▶ 1. 입력 이미지 형태(Shape): {image_3d_box.shape}")
-        print(f"▶ 2. Spacing 리스트 길이: {len(props['spacing'])}개")
-        print(f"▶ 3. Spacing 값: {props['spacing']}")
-        print("="*40 + "\n")
-        
-        
-        segmentation = predictor.predict_from_list_of_npy_arrays(
-            [image_3d_box],
-            None,
-            [props],
-            None,
-            1,
-            save_probabilities=False,
-            num_processes_segmentation_export=1
-        )
-        
-        target_mask = segmentation[0][0]
-        
-        ##-----------------------------------
-        ##  테스트 코드
-        ##-----------------------------------
-        # h, w = image_2d.shape[1], image_2d.shape[2]
-        # target_mask = np.zeros((h, w), dtype=np.uint8)
-        # cv2.circle(target_mask, (w//2, h//2), 50, 1, -1)
-        
-        # # ==========================================
-        # # 🛠️ [더미 테스트 코드] 가짜 다중 클래스 마스크 생성
-        # # ==========================================
-        # # 1. 원본 이미지와 똑같은 크기의 빈 까만 도화지(0)를 만듭니다.
-        # h, w = image_3d_box.shape[2], image_3d_box.shape[3]
-        # dummy_mask = np.zeros((h, w), dtype=np.uint8)
-
-        # # 2. 간(Liver, 라벨 1) 생성: 정중앙에 반지름 100짜리 큰 원을 그립니다.
-        # cv2.circle(dummy_mask, (w//2, h//2), 100, 1, -1)
-
-        # # 3. 종양(HCC, 라벨 2): 간 내부 우측 상단에 반지름 30짜리 작은 원을 그립니다.
-        # cv2.circle(dummy_mask, (w//2 + 40, h//2 - 40), 30, 2, -1)
-
-        # # 4. 가짜 도화지를 파이프라인에 넘겨줍니다!
-        # target_mask = dummy_mask
-        
-        
-        # 4. JSON 포맷팅
-        #✅ Segmentation MASK는 Class Name에 맞춰 JSON 파일로 형식화 하여 저장합니다.
-        # polylines = mask_to_polyline(target_mask, req.image_index)
-        
-        # 슬라이스의 실제 UID 추출
-        InstanceUID = os.path.basename(ref_dcm.filename)
-        
+        if predictor == "DUMMY_MODE":
+            h, w = image_3d_box.shape[2], image_3d_box.shape[3]
+            target_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.circle(target_mask, (w//2, h//2), 100, 1, -1)
+            cv2.circle(target_mask, (w//2 + 40, h//2 - 40), 30, 2, -1)
+            
+        else:
+            segmentation = predictor.predict_from_list_of_npy_arrays(
+                [image_3d_box], None, [props], None, 1, save_probabilities=False, num_processes_segmentation_export=1
+            )
+            target_mask = segmentation[0][0]
+            # # ==========================================
+            # # 💡 [디버깅] 모델이 도화지에 무슨 색을 칠했는지 확인!
+            # # ==========================================
+            # unique_values = np.unique(target_mask)
+            # print(f"▶ 🤖 AI 예측 결과 (픽셀 고유값): {unique_values}")
+            # if len(unique_values) == 1 and unique_values[0] == 0:
+            #     print("▶ 텅 빈 도화지입니다. (간/종양을 찾지 못함)")
+            
         CLASS_MAP = {
             1: {"name": "Liver", "color": "#FF0000"},
             2: {"name": "HCC", "color": "#00FF00"}
         }
         
         annotations = []
+        InstanceUID = os.path.basename(ref_dcm.filename)
         
         for class_idx, class_info in CLASS_MAP.items():
             binary_mask = (target_mask == class_idx).astype(np.uint8)
@@ -268,19 +210,15 @@ async def predict_segmentation(req: SegRequest):
                 continue
             
             polylines = mask_to_polyline(binary_mask, req.image_index)
-
             for poly in polylines:
-                annotation_node = {
+                annotations.append({
                     "data": {
                         "label": class_info["name"],
-                        "contour": {"closed":""},
+                        "contour": {"closed": True},
                         "handles": {
                             "points": [],
-                            "textBox": {
-                                "hasMoved": False,
-                                "worldPosition": [0, 0, 0]
-                            },
-                        "activeHandleIndex": None
+                            "textBox": {"hasMoved": False, "worldPosition": [0, 0, 0]},
+                            "activeHandleIndex": None
                         },
                         "polyline": poly,
                         "cachedStats": {}
@@ -291,13 +229,19 @@ async def predict_segmentation(req: SegRequest):
                         "toolName": "PlanarFreehandROI",
                         "referenceImageId": f"/local_data/{req.StudyUID}/{req.SeriesUID}/{InstanceUID}"
                     }
-                }
-                annotations.append(annotation_node)
-                
+                })
         return {"status": "success", "results": annotations}
-    
+
     except Exception as e:
-        return {"status": "error", "message": repr(e)}
+        return {"status": "error", "message": str(e)}
+    
+
+
+# 정적 파일
+if os.path.exists("app/static"):
+    app.mount("/", StaticFiles(directory="app/static", html=True), name="static")
+elif os.path.exists("static"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
     
 if __name__ == "__main__":
     import uvicorn

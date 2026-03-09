@@ -10,3 +10,14 @@ wheels/
 .venv
 local_data
 weights
+
+*.csv
+*.jpg
+*.png
+
+viewer_api.py
+test_api.py
+test_visualize.py
+
+temp_20141111/
+temp_uploads/
