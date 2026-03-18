@@ -29,17 +29,10 @@ def process_inference(task_id: str, req: SegRequest, predictor):
         image_3d_box, spacing_3d, ref_dcm = load_dicom_slice(req.StudyUID, req.SeriesUID, req.image_index)
         props = {'spacing': spacing_3d}
         
-        if predictor == "DUMMY_MODE":
-            time.sleep(2)
-            h, w = image_3d_box.shape[2], image_3d_box.shape[3]
-            target_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.circle(target_mask, (w//2, h//2), 100, 1, -1)
-            cv2.circle(target_mask, (w//2 + 40, h//2 - 40), 30, 2, -1)
-        else:
-            segmentation = predictor.predict_from_list_of_npy_arrays(
-                [image_3d_box], None, [props], None, 1, save_probabilities=False, num_processes_segmentation_export=1
-            )
-            target_mask = segmentation[0][0]
+        segmentation = predictor.predict_from_list_of_npy_arrays(
+            [image_3d_box], None, [props], None, 1, save_probabilities=False, num_processes_segmentation_export=1
+        )
+        target_mask = segmentation[0][0]
 
         CLASS_MAP = {1: {"name": "Liver", "color": "#FF0000"}, 2: {"name": "HCC", "color": "#00FF00"}}
         annotations = []

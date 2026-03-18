@@ -26,27 +26,19 @@ async def websocket_inference(websocket: WebSocket):
             
             predictor = websocket.app.state.models.get("predictor")
             
-            await websocket.send_json({"status": "processing", "message": "1/3: 데이터 로드 중..."})
-            await asyncio.sleep(0.2)
+            #await websocket.send_json({"status": "processing", "message": "1/3: 데이터 로드 중..."})
             
             image_3d_box, spacing_3d, ref_dcm = load_dicom_slice(StudyUID, SeriesUID, image_index)
             props = {'spacing': spacing_3d}
             
-            await websocket.send_json({"status": "processing", "message": "2/3: AI 모델 추론 중 ..."})
+            #await websocket.send_json({"status": "processing", "message": "2/3: AI 모델 추론 중 ..."})
             
-            if predictor == "DUMMY_MODE":
-                await asyncio.sleep(2)
-                h, w = image_3d_box.shape[2], image_3d_box.shape[3]
-                target_mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.circle(target_mask, (w//2, h//2), 100, 1, -1)
-                cv2.circle(target_mask, (w//2 + 40, h//2 - 40), 30, 2, -1)
-            else:
-                segmentation = predictor.predict_from_list_of_npy_arrays(
-                    [image_3d_box], None, [props], None, 1, save_probabilities=False, num_processes_segmentation_export=1
-                )
-                target_mask = segmentation[0][0]
+            segmentation = predictor.predict_from_list_of_npy_arrays(
+                [image_3d_box], None, [props], None, 1, save_probabilities=False, num_processes_segmentation_export=1
+            )
+            target_mask = segmentation[0][0]
 
-            await websocket.send_json({"status": "processing", "message": "3/3: 폴리라인 좌표 추출 중..."})
+            #await websocket.send_json({"status": "processing", "message": "3/3: 폴리라인 좌표 추출 중..."})
             
             CLASS_MAP = {1: {"name": "Liver", "color": "#FF0000"}, 2: {"name": "HCC", "color": "#00FF00"}}
             annotations = []

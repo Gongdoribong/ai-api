@@ -2,51 +2,68 @@
 
 (async function runPollingTest() {
     console.clear();
-    console.log("%c🚀 [Polling] 2초 대기 포함 10회 연속 테스트 시작!", "color: red; font-weight: bold; font-size: 14px;");
+    console.log("%c [Polling] 테스트 시작!", "color: red; font-weight: bold; font-size: 14px;");
     
     const payload = JSON.stringify({ StudyUID: "31867493", SeriesUID: "20141111", image_index: 93, ClassName: "Liver" });
     const MAX_REQUESTS = 10;
     let times = [];
+    let globalStartTime = performance.now();
 
-    for (let i = 1; i <= MAX_REQUESTS; i++) {
+    async function task(requestIndex) {
         let startTime = performance.now();
-        
+
         // POST 요청
         const submitRes = await fetch("http://127.0.0.1:8000/api/polling/submit", {
             method: "POST", headers: { "Content-Type": "application/json" }, body: payload
         });
         const { task_id } = await submitRes.json();
 
-        // GET 확인 루프 (0.2초 간격)
         while (true) {
             const statusRes = await fetch(`http://127.0.0.1:8000/api/polling/status/${task_id}`);
             const statusData = await statusRes.json();
-
+            
             if (statusData.status === "success" || statusData.status === "error") {
+                // 화면에 polygon 그리기
+                if (statusData.status === "success" && typeof drawPolygons === "function") {
+                    drawPolygons(statusData.results); // 📍 (script.js에 있는 함수 호출)
+                }
                 let elapsed = performance.now() - startTime;
                 times.push(elapsed);
-                
-                if (i < MAX_REQUESTS) {
-                    console.log(`[${i}/${MAX_REQUESTS}] 완료: ${elapsed.toFixed(1)} ms ⏳ (2초 대기 중...)`);
-                    // 💡 완료 후 2초(2000ms) 대기!
-                    await new Promise(r => setTimeout(r, 2000)); 
-                } else {
-                    console.log(`[${i}/${MAX_REQUESTS}] 완료: ${elapsed.toFixed(1)} ms`);
+                console.log(`✅ [${requestIndex}/${MAX_REQUESTS}] 완료: ${elapsed.toFixed(1)} ms`)
+
+                if (times.length === MAX_REQUESTS) {
+                    let totalElapsed = performance.now() - globalStartTime;
+                    printStats("Concurrent Polling", times, "purple", totalElapsed);
                 }
                 break;
             }
-            await new Promise(r => setTimeout(r, 200)); // 상태 폴링 간격
+            await new Promise(r => setTimeout(r, 200)); // 0.2초 마다 status 확인
         }
     }
-    printStats("Polling", times, "red");
+
+    for (let i = 1; i <= MAX_REQUESTS; i++) {
+        console.log(`요청 보냄: [${i}/${MAX_REQUESTS}]`);
+        task(i);
+        if (i < MAX_REQUESTS) {
+            await new Promise(r => setTimeout(r, 2000));    // 2초마다 요청 보내기 (총 10번)
+        }
+    }
 })();
 
-function printStats(name, timesArray, color) {
+function printStats(name, timesArray, color, totalElapsed) { // 📍 파라미터 추가
+    if (!timesArray || timesArray.length === 0) return;
+
     const avg = timesArray.reduce((a, b) => a + b, 0) / timesArray.length;
     const stdDev = Math.sqrt(timesArray.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / timesArray.length);
+    
     console.log(`%c========================================`, `color: ${color};`);
     console.log(`%c📊 [${name} 테스트 결과 요약]`, `color: ${color}; font-weight: bold;`);
-    console.log(`▶ 평균 응답 시간 : ${avg.toFixed(1)} ms`);
-    console.log(`▶ 연산 시간 편차 : ±${stdDev.toFixed(1)} ms`);
+    console.log(`▶ 1회 평균 응답 시간 : ${avg.toFixed(1)} ms`);
+    console.log(`▶ 연산 시간 편차   : ±${stdDev.toFixed(1)} ms`);
+    
+    // 📍 총 소요 시간 출력 로직 추가
+    if (totalElapsed) {
+        console.log(`▶ 전체 테스트 총 소요 시간 : ${totalElapsed.toFixed(1)} ms`);
+    }
     console.log(`%c========================================`, `color: ${color};`);
 }
