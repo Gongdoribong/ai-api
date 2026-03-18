@@ -328,4 +328,12 @@ function runAutoInferenceWebSocket() {
         loadingBox.style.display = 'none';
     };
 }
+// 💡 [추가] HTML의 "Open Folder" 버튼을 클릭했을 때 파일 선택창이 뜨도록 연결
+function openFolder() {
+    document.getElementById('folderInput').click();
+}
 
+// 💡 전역 노출
+window.drawPolygons = drawPolygons;
+window.openFolder = openFolder;
+window.executeAutoSegment = executeAutoSegment;

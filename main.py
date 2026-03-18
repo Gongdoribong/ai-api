@@ -177,24 +177,17 @@ async def predict_segmentation(req: SegRequest, request: Request):
         image_3d_box, spacing_3d, ref_dcm = load_dicom_slice(req.StudyUID, req.SeriesUID, req.image_index)
         props = {'spacing': spacing_3d}
         
-        if predictor == "DUMMY_MODE":
-            h, w = image_3d_box.shape[2], image_3d_box.shape[3]
-            target_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.circle(target_mask, (w//2, h//2), 100, 1, -1)
-            cv2.circle(target_mask, (w//2 + 40, h//2 - 40), 30, 2, -1)
-            
-        else:
-            segmentation = predictor.predict_from_list_of_npy_arrays(
-                [image_3d_box], None, [props], None, 1, save_probabilities=False, num_processes_segmentation_export=1
-            )
-            target_mask = segmentation[0][0]
-            # # ==========================================
-            # # 💡 [디버깅] 모델이 도화지에 무슨 색을 칠했는지 확인!
-            # # ==========================================
-            # unique_values = np.unique(target_mask)
-            # print(f"▶ 🤖 AI 예측 결과 (픽셀 고유값): {unique_values}")
-            # if len(unique_values) == 1 and unique_values[0] == 0:
-            #     print("▶ 텅 빈 도화지입니다. (간/종양을 찾지 못함)")
+        segmentation = predictor.predict_from_list_of_npy_arrays(
+            [image_3d_box], None, [props], None, 1, save_probabilities=False, num_processes_segmentation_export=1
+        )
+        target_mask = segmentation[0][0]
+        # # ==========================================
+        # # 💡 [디버깅] 모델이 도화지에 무슨 색을 칠했는지 확인!
+        # # ==========================================
+        # unique_values = np.unique(target_mask)
+        # print(f"▶ 🤖 AI 예측 결과 (픽셀 고유값): {unique_values}")
+        # if len(unique_values) == 1 and unique_values[0] == 0:
+        #     print("▶ 텅 빈 도화지입니다. (간/종양을 찾지 못함)")
             
         CLASS_MAP = {
             1: {"name": "Liver", "color": "#FF0000"},
